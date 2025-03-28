@@ -1,10 +1,13 @@
-import sqlite3
+import os
 import datetime
 import pandas as pd
-from time import sleep
 import streamlit as st
+from time import sleep
+import mysql.connector
 from typing import Tuple
 import plotly.express as px
+from dotenv import load_dotenv
+from mysql.connector import pooling
 
 
 st.set_page_config(
@@ -24,6 +27,7 @@ st.title(":orange[Swarajya] - :red[Entry Management] 🍽️")
 # ------------------------------------------------------------------------------
 
 if "query" not in st.session_state:
+    load_dotenv()
     st.session_state.query = ""
 
 if "data" not in st.session_state:
@@ -35,35 +39,68 @@ if "last_fetched" not in st.session_state:
 if "filtered_data" not in st.session_state:
     st.session_state.filtered_data = None
 
-if "all_cols" not in st.session_state:
-    st.session_state.all_cols = [
-        'reg', 'name', 'email', 'phone', 'gender', 'status', 'timestamp', 'search_str']
+# All columns in the database:
+# ['reg', 'name', 'email', 'phone', 'gender', 'status', 'timestamp', 'search_str']
 
 if "visible_cols" not in st.session_state:
     st.session_state.visible_cols = [
         'Reg. No.', 'Name', 'Email Id', 'Phone No.', 'Gender', 'Status', 'Timestamp']
+
+if "db_pool" not in st.session_state:
+    st.session_state.db_pool = pooling.MySQLConnectionPool(
+        pool_name="swarajya_pool",
+        pool_size=5,
+        host=os.getenv("DB_HOST"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME")
+    )
 
 
 # ------------------------------------------------------------------------------
 # Helper Functions:
 # ------------------------------------------------------------------------------
 
-def get_all_data(get_headers: bool = False):
+def get_connection() -> mysql.connector.MySQLConnection:
+    """Get a connection from the pool."""
+    try:
+        conn = st.session_state.db_pool.get_connection()
+        return conn
+    except mysql.connector.Error as err:
+        st.error(f"Error: {err}")
+        return None
+
+
+def get_all_data(get_headers: bool = False) -> Tuple[list, list]:
     """Load all the entries from the database."""
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM data")
+    conn, cursor = None, None
 
-    data = cursor.fetchall()
-    headers = None
-    if get_headers:
-        headers = [description[0] for description in cursor.description]
+    try:
+        conn = get_connection()
+        if not conn:
+            raise ConnectionError("Database connection unavailable.")
+        cursor = conn.cursor()
 
-    conn.close()
-    return data, headers
+        cursor.execute("SELECT * FROM data;")
+        full_data = cursor.fetchall()
+
+        if get_headers:
+            # Fetch the column names from the cursor description
+            headers = [description[0] for description in cursor.description]
+        else:
+            headers = None
+
+        return full_data, headers
+
+    except Exception as e:
+        st.toast(f"Error: {e}", icon="❌")
+
+    finally:
+        cursor.close()
+        conn.close()
 
 
-def update_entry(reg_no: str, to_mark: bool = False) -> Tuple[bool, str]:
+def update_entry(reg_no: str, to_mark: bool = False) -> None:
     """Update the entry in the database."""
 
     with database_operation_progress.container(border=True):
@@ -71,38 +108,52 @@ def update_entry(reg_no: str, to_mark: bool = False) -> Tuple[bool, str]:
             info = f"Marking **{reg_no}** as {'**Entered**' if to_mark else '**Not Entered**'}..."
             st.info(info, icon="🔄")
 
-            sleep(1)
+            sleep(0.5)
             success = 0
 
             try:
-                conn = sqlite3.connect("database.db")
+                conn = get_connection()
+                if not conn:
+                    raise ConnectionError("Database connection unavailable.")
+
+                # Get a cursor from the connection:
                 cursor = conn.cursor()
+
+                # Lock the row: (Retry up to 3 times if already locked)
+                for _ in range(3):
+                    try:
+                        lock = "SELECT status FROM data WHERE reg = %s FOR UPDATE"
+                        cursor.execute(lock, (reg_no,))
+                        cursor.fetchall()
+                        # Exit loop if successful
+                        break
+                    except mysql.connector.errors.DatabaseError:
+                        # Wait a bit before retrying
+                        sleep(0.1)
+
                 new_status = 1 if to_mark else 0
 
-                if new_status == 1:
-                    # Set status to 1 and update timestamp to current time
-                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    cursor.execute(
-                        "UPDATE data SET status = ?, timestamp = ? WHERE reg = ?",
-                        (new_status, timestamp, reg_no)
-                    )
-                else:
-                    # Set status to 0 and clear the timestamp
-                    cursor.execute(
-                        "UPDATE data SET status = ?, timestamp = NULL WHERE reg = ?",
-                        (new_status, reg_no)
-                    )
+                query = """
+                    UPDATE data 
+                    SET status = %s, timestamp = %s 
+                    WHERE reg = %s
+                """
+                timestamp = datetime.datetime.now() if new_status == 1 else None
+                cursor.execute(query, (new_status, timestamp, reg_no))
                 conn.commit()
 
                 # Check if any row was updated
                 success = cursor.rowcount
 
-            except sqlite3.Error as e:
+            except Exception as e:
                 # return False, f"Error updating entry: {e}"
-                st.toast(f"Error updating entry: {e}", icon="⚠️")
+                st.toast(f"Error updating entry: {e}", icon="❌")
 
             finally:
-                conn.close()
+                if cursor:
+                    cursor.close()
+                if conn:
+                    conn.close()
                 # st.toast("Done", icon="😇")
 
             if success > 0:
@@ -115,7 +166,7 @@ def update_entry(reg_no: str, to_mark: bool = False) -> Tuple[bool, str]:
                 # return False, f"No ({success}) entries updated."
 
 
-def clear_input():
+def clear_input() -> None:
     st.session_state['query'] = ""
     st.session_state.filtered_data = None
     st.session_state.data = load_data()
@@ -123,7 +174,7 @@ def clear_input():
 
 # fetch data every time the page is loaded with cache for 2 seconds:
 @st.cache_data(ttl=2)
-def load_data():
+def load_data() -> pd.DataFrame:
     data, headers = get_all_data(get_headers=True)
     df = pd.DataFrame(data, columns=headers)
     df['status'] = df['status'].astype(bool)
@@ -313,6 +364,6 @@ st.dataframe(
     # st.session_state.data,
     # column_order=['reg', 'name', 'gender', 'email', 'phone', 'status'],
     use_container_width=True,
-    hide_index=True,
+    # hide_index=True,
 )
 # st.table(data=show_data)
