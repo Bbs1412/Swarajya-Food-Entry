@@ -1,0 +1,8 @@
+venv/
+.vscode/
+.env
+*csv*
+*.db
+Docs/
+test*
+z_*

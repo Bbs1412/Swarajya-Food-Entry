@@ -1,0 +1,16 @@
+pandas
+plotly
+streamlit
+python-dotenv
+mysql-connector-python
+# pymysql
+# ipykernel
+
+# These are the versions I used to run the code:
+# PYTHON 3.11.9
+# pandas==2.2.3
+# plotly==6.0.1
+# ipykernel==6.29.5
+# streamlit==1.44.0
+# python-dotenv==1.1.0
+# mysql-connector-python==9.2.0
